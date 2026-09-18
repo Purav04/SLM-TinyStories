@@ -47,6 +47,61 @@ class TestMatmul:
         torch.testing.assert_close(out, ref, atol=ATOL, rtol=RTOL)
 
 
+class TestMatmulTiled:
+    """Same checks as TestMatmul, against the Phase 2 shared-memory tiled
+    kernel instead of the Phase 1 naive one. Shapes are deliberately not
+    multiples of TILE_DIM (32) to exercise the tile boundary-padding logic,
+    and all four transpose combinations are covered here (Phase 1 only
+    tested three) since the tiled kernel's load/compute indexing is
+    transpose-direction-specific in both A and B."""
+
+    def test_forward_no_transpose(self):
+        _needs_ext()
+        import slm_cuda_kernels as _C
+        A = torch.randn(65, 90, device=DEVICE)
+        B = torch.randn(90, 45, device=DEVICE)
+        out = _C.matmul_tiled(A, B, False, False)
+        ref = A @ B
+        torch.testing.assert_close(out, ref, atol=ATOL, rtol=RTOL)
+
+    def test_forward_transpose_b(self):
+        _needs_ext()
+        import slm_cuda_kernels as _C
+        A = torch.randn(65, 90, device=DEVICE)
+        B = torch.randn(45, 90, device=DEVICE)
+        out = _C.matmul_tiled(A, B, False, True)
+        ref = A @ B.t()
+        torch.testing.assert_close(out, ref, atol=ATOL, rtol=RTOL)
+
+    def test_forward_transpose_a(self):
+        _needs_ext()
+        import slm_cuda_kernels as _C
+        A = torch.randn(90, 65, device=DEVICE)
+        B = torch.randn(90, 45, device=DEVICE)
+        out = _C.matmul_tiled(A, B, True, False)
+        ref = A.t() @ B
+        torch.testing.assert_close(out, ref, atol=ATOL, rtol=RTOL)
+
+    def test_forward_transpose_both(self):
+        _needs_ext()
+        import slm_cuda_kernels as _C
+        A = torch.randn(90, 65, device=DEVICE)
+        B = torch.randn(45, 90, device=DEVICE)
+        out = _C.matmul_tiled(A, B, True, True)
+        ref = A.t() @ B.t()
+        torch.testing.assert_close(out, ref, atol=ATOL, rtol=RTOL)
+
+    def test_matches_naive_kernel(self):
+        _needs_ext()
+        import slm_cuda_kernels as _C
+        A = torch.randn(64, 64, device=DEVICE)
+        B = torch.randn(64, 64, device=DEVICE)
+        torch.testing.assert_close(
+            _C.matmul_tiled(A, B, False, False), _C.matmul(A, B, False, False),
+            atol=ATOL, rtol=RTOL,
+        )
+
+
 class TestCudaLinear:
     def test_forward_backward_vs_nn_linear(self):
         _needs_ext()

@@ -1,33 +1,61 @@
-"""Phase 1/3 benchmark skeleton: naive CUDA kernels vs native PyTorch.
+"""Benchmark: naive vs tiled CUDA kernels vs native PyTorch (cuBLAS/ATen).
 
-This gives wall-clock numbers now; extend it later with Nsight
-Compute/Systems runs and a roofline analysis (Phase 3), and add the
-tiled/fused kernel variants as new rows once Phase 2 lands.
+Extend later with Nsight Compute/Systems runs and a roofline analysis
+(Phase 3), and add the fused-kernel variants once they land.
 
 Run on a CUDA machine (e.g. ASU Sol): python benchmarks/bench.py
 """
+import os
+import sys
 import torch
 import torch.nn.functional as F
 
+# `python benchmarks/bench.py` puts this file's own directory on sys.path,
+# not the repo root — add the root explicitly so `kernels`/`model` (which
+# live there, not as installed packages) are importable regardless of cwd.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import slm_cuda_kernels as _C
 from kernels import CudaLinear, CudaLayerNorm, cuda_softmax
 
 DEVICE = "cuda"
 WARMUP, ITERS = 10, 100
 
 
-def _time(fn, *args):
-    for _ in range(WARMUP):
+def _time(fn, *args, warmup=WARMUP, iters=ITERS):
+    for _ in range(warmup):
         fn(*args)
     torch.cuda.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
-    for _ in range(ITERS):
+    for _ in range(iters):
         fn(*args)
     end.record()
     torch.cuda.synchronize()
-    return start.elapsed_time(end) / ITERS  # ms/iter
+    return start.elapsed_time(end) / iters  # ms/iter
+
+
+def bench_matmul_variants(M=1024, N=1024, K=1024):
+    """Raw GEMM, no autograd/bias overhead: naive vs tiled vs cuBLAS. This is
+    the naive-vs-tiled-vs-cuBLAS number for the Phase 3 speedup chart.
+    Kept at 1024^3 (not e.g. 4096^3) on purpose — the naive O(N^3),
+    no-reuse kernel is slow enough that a larger size makes this take
+    minutes just from the naive leg."""
+    A = torch.randn(M, K, device=DEVICE)
+    B = torch.randn(K, N, device=DEVICE)
+
+    t_naive = _time(lambda: _C.matmul(A, B, False, False), warmup=3, iters=10)
+    t_tiled = _time(lambda: _C.matmul_tiled(A, B, False, False))
+    t_torch = _time(lambda: A @ B)
+
+    flops = 2 * M * N * K  # multiply-add = 2 FLOPs
+    gflops_per_sec = lambda t_ms: flops * 1e-6 / t_ms  # flops * 1e-9 / (t_ms * 1e-3)
+    print(f"Matmul  [{M}x{K} @ {K}x{N}]")
+    print(f"  naive : {t_naive:.3f}ms  ({gflops_per_sec(t_naive):.1f} GFLOP/s)")
+    print(f"  tiled : {t_tiled:.3f}ms  ({gflops_per_sec(t_tiled):.1f} GFLOP/s)  speedup over naive={t_naive/t_tiled:.2f}x")
+    print(f"  torch : {t_torch:.3f}ms  ({gflops_per_sec(t_torch):.1f} GFLOP/s)  tiled is {t_torch/t_tiled*100:.1f}% of cuBLAS throughput")
 
 
 def bench_linear(batch=32, seq=256, d_in=768, d_out=768):
@@ -101,6 +129,7 @@ def bench_layernorm(batch=32, seq=256, d=768):
 if __name__ == "__main__":
     assert torch.cuda.is_available(), "benchmarks need a CUDA GPU"
     print(f"Device: {torch.cuda.get_device_name(0)}")
+    bench_matmul_variants()
     bench_linear()
     bench_softmax()
     bench_layernorm()

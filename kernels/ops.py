@@ -19,10 +19,13 @@ def _flatten(x):
 
 
 class CudaLinearFunction(torch.autograd.Function):
+    # Phase 2: routed through the shared-memory tiled GEMM (_C.matmul_tiled)
+    # instead of Phase 1's naive kernel (_C.matmul, still exposed for the
+    # naive-vs-tiled-vs-torch benchmark comparison in benchmarks/bench.py).
     @staticmethod
     def forward(ctx, x, weight, bias):
         x2d, orig_shape = _flatten(x)
-        out2d = _C.matmul(x2d, weight, False, True)  # x @ W^T
+        out2d = _C.matmul_tiled(x2d, weight, False, True)  # x @ W^T
         if bias is not None:
             out2d = out2d + bias
         ctx.save_for_backward(x2d, weight, bias if bias is not None else torch.empty(0))
@@ -35,8 +38,8 @@ class CudaLinearFunction(torch.autograd.Function):
         x2d, weight, _ = ctx.saved_tensors
         grad_out2d = grad_out.reshape(-1, grad_out.shape[-1]).contiguous()
 
-        grad_x = _C.matmul(grad_out2d, weight, False, False)       # grad_out @ W
-        grad_weight = _C.matmul(grad_out2d, x2d, True, False)      # grad_out^T @ x
+        grad_x = _C.matmul_tiled(grad_out2d, weight, False, False)   # grad_out @ W
+        grad_weight = _C.matmul_tiled(grad_out2d, x2d, True, False)  # grad_out^T @ x
         grad_bias = grad_out2d.sum(dim=0) if ctx.has_bias else None
 
         return grad_x.reshape(ctx.orig_shape), grad_weight, grad_bias

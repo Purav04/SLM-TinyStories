@@ -1,10 +1,12 @@
 // LayerNorm, one CUDA block per row. Forward saves per-row mean and rstd
-// (1/sqrt(var+eps)) so backward doesn't recompute them. Backward uses the
-// standard LayerNorm gradient formula (see e.g. the "Deep Learning" LN
-// derivation): two per-row reductions for dx, plus a column-wise
-// reduction across rows for dweight/dbias done here via atomicAdd — the
-// naive-but-correct choice for Phase 1. Phase 2 replaces the atomics with
-// a proper reduction kernel.
+// (1/sqrt(var+eps)) so backward doesn't recompute them.
+//
+// Phase 2: the per-row reductions (mean, variance, and backward's
+// sum(dxhat)/sum(dxhat*xhat)) use __shfl_down_sync warp shuffles
+// (blockReduceSum in common.h) instead of Phase 1's shared-memory tree.
+// dweight/dbias backward still uses atomicAdd across rows — that's a
+// separate, still-open optimization (a proper column-reduction kernel),
+// not part of this pass.
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -15,36 +17,21 @@ __global__ void layernorm_forward_kernel(
     const float* __restrict__ bias, float* __restrict__ y,
     float* __restrict__ mean_out, float* __restrict__ rstd_out,
     int N, float eps) {
-  extern __shared__ float shared[];
   int row = blockIdx.x;
   const float* x_row = x + (size_t)row * N;
   float* y_row = y + (size_t)row * N;
 
   float local_sum = 0.0f;
   for (int i = threadIdx.x; i < N; i += blockDim.x) local_sum += x_row[i];
-  shared[threadIdx.x] = local_sum;
-  __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
-    __syncthreads();
-  }
-  float mean = shared[0] / N;
-  __syncthreads();
+  float mean = blockReduceSum(local_sum) / N;
 
   float local_var = 0.0f;
   for (int i = threadIdx.x; i < N; i += blockDim.x) {
     float d = x_row[i] - mean;
     local_var += d * d;
   }
-  shared[threadIdx.x] = local_var;
-  __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) shared[threadIdx.x] += shared[threadIdx.x + stride];
-    __syncthreads();
-  }
-  float var = shared[0] / N;
+  float var = blockReduceSum(local_var) / N;
   float rstd = rsqrtf(var + eps);
-  __syncthreads();
 
   if (threadIdx.x == 0) {
     mean_out[row] = mean;
@@ -62,10 +49,6 @@ __global__ void layernorm_backward_kernel(
     const float* __restrict__ weight, const float* __restrict__ mean,
     const float* __restrict__ rstd, float* __restrict__ dx,
     float* __restrict__ dweight, float* __restrict__ dbias, int N) {
-  extern __shared__ float shared[];
-  float* s_a = shared;              // sum(dxhat)
-  float* s_b = shared + blockDim.x; // sum(dxhat * xhat)
-
   int row = blockIdx.x;
   const float* x_row = x + (size_t)row * N;
   const float* dy_row = dy + (size_t)row * N;
@@ -73,28 +56,23 @@ __global__ void layernorm_backward_kernel(
   float row_mean = mean[row];
   float row_rstd = rstd[row];
 
-  float local_a = 0.0f, local_b = 0.0f;
+  float local_a = 0.0f;  // sum(dxhat)
   for (int i = threadIdx.x; i < N; i += blockDim.x) {
     float xhat = (x_row[i] - row_mean) * row_rstd;
     float dxhat = dy_row[i] * weight[i];
     local_a += dxhat;
-    local_b += dxhat * xhat;
     atomicAdd(&dweight[i], dy_row[i] * xhat);
     atomicAdd(&dbias[i], dy_row[i]);
   }
-  s_a[threadIdx.x] = local_a;
-  s_b[threadIdx.x] = local_b;
-  __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) {
-      s_a[threadIdx.x] += s_a[threadIdx.x + stride];
-      s_b[threadIdx.x] += s_b[threadIdx.x + stride];
-    }
-    __syncthreads();
+  float mean_dxhat = blockReduceSum(local_a) / N;
+
+  float local_b = 0.0f;  // sum(dxhat * xhat)
+  for (int i = threadIdx.x; i < N; i += blockDim.x) {
+    float xhat = (x_row[i] - row_mean) * row_rstd;
+    float dxhat = dy_row[i] * weight[i];
+    local_b += dxhat * xhat;
   }
-  float mean_dxhat = s_a[0] / N;
-  float mean_dxhat_xhat = s_b[0] / N;
-  __syncthreads();
+  float mean_dxhat_xhat = blockReduceSum(local_b) / N;
 
   for (int i = threadIdx.x; i < N; i += blockDim.x) {
     float xhat = (x_row[i] - row_mean) * row_rstd;
@@ -116,8 +94,7 @@ std::vector<torch::Tensor> layernorm_forward_cuda(
   auto rstd = torch::empty({M}, x.options());
 
   int block = pick_row_block_size(N);
-  size_t shmem = block * sizeof(float);
-  layernorm_forward_kernel<<<M, block, shmem, at::cuda::getCurrentCUDAStream()>>>(
+  layernorm_forward_kernel<<<M, block, 0, at::cuda::getCurrentCUDAStream()>>>(
       x.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(),
       y.data_ptr<float>(), mean.data_ptr<float>(), rstd.data_ptr<float>(),
       N, static_cast<float>(eps));
@@ -140,8 +117,7 @@ std::vector<torch::Tensor> layernorm_backward_cuda(
   auto dbias = torch::zeros_like(weight);
 
   int block = pick_row_block_size(N);
-  size_t shmem = 2 * block * sizeof(float);
-  layernorm_backward_kernel<<<M, block, shmem, at::cuda::getCurrentCUDAStream()>>>(
+  layernorm_backward_kernel<<<M, block, 0, at::cuda::getCurrentCUDAStream()>>>(
       grad_out.data_ptr<float>(), x.data_ptr<float>(), weight.data_ptr<float>(),
       mean.data_ptr<float>(), rstd.data_ptr<float>(), dx.data_ptr<float>(),
       dweight.data_ptr<float>(), dbias.data_ptr<float>(), N);
