@@ -4,9 +4,25 @@
 // Phase 2: the per-row reductions (mean, variance, and backward's
 // sum(dxhat)/sum(dxhat*xhat)) use __shfl_down_sync warp shuffles
 // (blockReduceSum in common.h) instead of Phase 1's shared-memory tree.
-// dweight/dbias backward still uses atomicAdd across rows — that's a
-// separate, still-open optimization (a proper column-reduction kernel),
-// not part of this pass.
+//
+// dweight/dbias use atomicAdd, one add per row per column, fused into the
+// same pass as dx. This looks like an obvious bottleneck ("8192 rows all
+// atomically adding into the same 768-wide buffer!") and two alternatives
+// were tried and measured worse on Sol (A100, M=8192, N=768):
+//   - a dedicated one-thread-per-column kernel (no contention, but only
+//     768 threads total — a few blocks on a 108-SM chip while the rest
+//     sits idle): 2.36ms, 7x worse than the atomics version.
+//   - delegating to ATen's `.sum(0)` (well-parallelized, but pays for a
+//     separate xhat materialization plus a reduction along the
+//     non-contiguous dim-0 axis, and a Python/dispatch round trip): 0.40ms,
+//     still ~20% worse than the atomics version.
+// Measured atomics: 0.33ms. The buffer atomics contend on is tiny (768
+// floats, 3KB) and stays resident in L2, so contention costs far less here
+// than "avoid atomics" folk wisdom suggests — this fused single-kernel
+// pass beats both alternatives that were supposed to fix it. A
+// warp-level partial-sum-before-atomic (cutting atomic traffic ~32x) is a
+// plausible further win, not attempted here given the diminishing returns
+// already observed on this non-flagship reduction.
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <ATen/cuda/CUDAContext.h>
